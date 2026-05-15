@@ -264,6 +264,17 @@ class LazyPerceptionModuleConfig(MemoryModuleConfig):
     foreground_gap: float = 0.10        # empty-depth span that ends the cluster
     foreground_min_points: int = 50     # below this, skip filtering (keep all)
 
+    # Persisted scene/object model (scene_store.py). VLM-confirmed detections
+    # are upserted into a memory2 ``objects_scene`` stream with stable identity
+    # (spatial dedup) + first/last_seen, surviving process restarts.
+    #  - scene_match_distance: two detections within this many meters are the
+    #    same object (ObjectDB's name-agnostic spatial dedup).
+    #  - scene_ttl_s: an object whose last_seen is older than this drops out of
+    #    the *active* scene published to Meshcat/the planner. recall() ignores
+    #    this and queries full history ("last saw X 3h ago" still works).
+    scene_match_distance: float = 0.15
+    scene_ttl_s: float = 300.0
+
 
 @runtime_checkable
 class LazyPerceptionModuleSpec(Protocol):

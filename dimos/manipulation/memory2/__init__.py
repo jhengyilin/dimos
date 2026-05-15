@@ -7,6 +7,7 @@ for the architecture docstring, configs, and Protocol definitions.
 
 from dimos.manipulation.memory2.lazy_perception import LazyPerceptionModule
 from dimos.manipulation.memory2.recorder import RGBDCameraRecorder
+from dimos.manipulation.memory2.scene_store import SceneObject, SceneStore
 from dimos.manipulation.memory2.spec import (
     LazyPerceptionModuleConfig,
     LazyPerceptionModuleSpec,
@@ -21,4 +22,6 @@ __all__ = [
     "RGBDCameraRecorder",
     "RGBDCameraRecorderConfig",
     "RGBDCameraRecorderSpec",
+    "SceneObject",
+    "SceneStore",
 ]

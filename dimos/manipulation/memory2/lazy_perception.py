@@ -15,6 +15,7 @@ import numpy as np
 from dimos.agents.annotation import skill
 from dimos.core.core import rpc
 from dimos.core.stream import Out
+from dimos.manipulation.memory2.scene_store import SceneStore
 from dimos.manipulation.memory2.spec import LazyPerceptionModuleConfig
 from dimos.memory2.module import MemoryModule
 from dimos.models.embedding.base import EmbeddingModel
@@ -53,6 +54,11 @@ class LazyPerceptionModule(MemoryModule):
 
     _vlm: VlModel | None = None
     _clip: EmbeddingModel | None = None
+    _scene: SceneStore | None = None
+    # object_id -> latest full DetObject (with geometry) seen THIS session.
+    # The scene store persists identity/timestamps cross-session; geometry for
+    # Meshcat/planner only exists for objects actually captured this run.
+    _obj_cache: dict[str, DetObject]
 
     @rpc
     def start(self) -> None:
@@ -61,6 +67,8 @@ class LazyPerceptionModule(MemoryModule):
         self._vlm.start()
         self._clip = self.register_disposable(self.config.embedding_model())
         self._clip.start()
+        self._scene = SceneStore(self.store, match_distance=self.config.scene_match_distance)
+        self._obj_cache = {}
 
     # ------------------------------------------------------------------ skills
 
@@ -76,25 +84,22 @@ class LazyPerceptionModule(MemoryModule):
         """
         prompt_list = [p.strip() for p in prompt.split(",") if p.strip()]
         if not prompt_list:
-            self.objects.publish([])
+            self._scene_publish([])  # keep the existing scene; don't wipe Meshcat
             return "No prompts provided."
 
         all_objects: list[DetObject] = []
-        most_recent_ts: float | None = None
         for single in prompt_list:
-            objs, ts = self._find_and_project(
+            objs, _ = self._find_and_project(
                 single,
                 build_query=lambda stream, vec: stream.search(vec),
             )
             all_objects.extend(objs)
-            if ts is not None and (most_recent_ts is None or ts > most_recent_ts):
-                most_recent_ts = ts
 
-        self.objects.publish(all_objects)
+        most_recent_ts = self._scene_publish(all_objects)
         if not all_objects:
             return f"No confident '{prompt}' match in memory."
 
-        age = _relative_time(most_recent_ts) if most_recent_ts is not None else "unknown age"
+        age = _relative_time(most_recent_ts) if most_recent_ts is not None else "just now"
         lines = [self._fmt_object_line(o) for o in all_objects]
         return f"Found {len(all_objects)} object(s) matching '{prompt}' (seen {age}):\n" + "\n".join(lines)
 
@@ -117,26 +122,23 @@ class LazyPerceptionModule(MemoryModule):
         """
         prompt_list = [p.strip() for p in prompt.split(",") if p.strip()]
         if not prompt_list:
-            self.objects.publish([])
+            self._scene_publish([])  # keep the existing scene; don't wipe Meshcat
             return "No prompts provided."
 
         pose = (x, y, z)
         all_objects: list[DetObject] = []
-        most_recent_ts: float | None = None
         for single in prompt_list:
-            objs, ts = self._find_and_project(
+            objs, _ = self._find_and_project(
                 single,
                 build_query=lambda stream, vec: stream.near(pose, radius).search(vec),
             )
             all_objects.extend(objs)
-            if ts is not None and (most_recent_ts is None or ts > most_recent_ts):
-                most_recent_ts = ts
 
-        self.objects.publish(all_objects)
+        most_recent_ts = self._scene_publish(all_objects)
         if not all_objects:
             return f"No confident '{prompt}' match near ({x:.2f}, {y:.2f}, {z:.2f}) within {radius}m."
 
-        age = _relative_time(most_recent_ts) if most_recent_ts is not None else "unknown age"
+        age = _relative_time(most_recent_ts) if most_recent_ts is not None else "just now"
         lines = [self._fmt_object_line(o) for o in all_objects]
         return (
             f"Found {len(all_objects)} object(s) matching '{prompt}' "
@@ -146,37 +148,81 @@ class LazyPerceptionModule(MemoryModule):
 
     @skill
     def recall(self, name: str) -> str:
-        """Where did I last see something matching ``name``?
+        """When and where did I last actually see something matching ``name``?
 
-        Cheaper than ``find_objects``: no VLM, no 3D projection. Returns
-        the camera pose at the most recent confident semantic match plus
-        timestamp. Works across process restarts because memory2's SQLite
-        store is the persistence layer.
+        Reads the persisted scene model (VLM-confirmed object sightings), NOT
+        raw CLIP frame matches — so "(seen N ago)" reflects the true last time
+        the object was genuinely present, ages correctly, and works across
+        process restarts (the scene stream persists in the SQLite store).
+        No VLM/CLIP call: pure lookup, cheap.
         """
-        if self._clip is None:
+        if self._scene is None:
             return f"No memory of '{name}'."
         try:
-            vec = self._clip.embed_text(name)
-            obs = (
-                self.store.streams.color_image_embedded
-                    .search(vec)
-                    .filter(lambda o: (o.similarity or 0) >= self.config.min_similarity)
-                    .order_by("ts", desc=True)
-                    .first()
-            )
-        except (AttributeError, LookupError):
-            return f"No memory of '{name}'."
-        except Exception as e:
+            rec = self._scene.last_seen(name)
+        except Exception as e:  # noqa: BLE001
             logger.warning("recall(%r) failed: %s", name, e)
             return f"No memory of '{name}'."
 
-        age = _relative_time(obs.ts)
-        if obs.pose:
-            x, y, z = obs.pose[0], obs.pose[1], obs.pose[2]
-            return f"Last saw '{name}' with camera near ({x:.2f}, {y:.2f}, {z:.2f}) ({age})."
-        return f"Last saw '{name}' (camera pose unknown) ({age})."
+        if rec is None:
+            return f"No memory of '{name}'."
+        age = _relative_time(rec.last_seen)
+        return (
+            f"Last saw '{rec.name}' at ({rec.x:.2f}, {rec.y:.2f}, {rec.z:.2f}) "
+            f"({age}); seen {rec.count}x total."
+        )
 
     # ----------------------------------------------------------- internal
+
+    def _scene_publish(self, new_objects: list[DetObject]) -> float | None:
+        """Upsert VLM-confirmed detections into the persisted scene, cache
+        their geometry for this session, then publish the FULL active scene
+        — not just this query's hits. This is what fixes both symptoms:
+
+        - recall reads the scene's last_seen (truthful, cross-session).
+        - Publishing the full active set (instead of the per-prompt slice)
+          makes the full-replace obstacle/Meshcat consumer keep every known
+          object instead of evicting everything outside the current prompt.
+
+        Returns the most-recent last_seen among ``new_objects`` (for the
+        "(seen N ago)" line — ≈now since they were just VLM-confirmed).
+        """
+        most_recent: float | None = None
+        if self._scene is None:
+            try:
+                self.objects.publish(list(new_objects))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("publish failed: %s", e)
+            return None
+
+        for det in new_objects:
+            c = det.center
+            try:
+                rec = self._scene.upsert(
+                    det.name, float(c.x), float(c.y), float(c.z)
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("scene upsert failed (%s): %s", det.name, e)
+                continue
+            det.object_id = rec.object_id
+            self._obj_cache[rec.object_id] = det
+            if most_recent is None or rec.last_seen > most_recent:
+                most_recent = rec.last_seen
+
+        # Full active scene → only objects whose geometry we captured this
+        # session can be drawn/planned-against; identity/last_seen for the
+        # rest still lives in the persisted store for recall.
+        try:
+            active = self._scene.current_scene(self.config.scene_ttl_s)
+            publish = [
+                self._obj_cache[o.object_id]
+                for o in active
+                if o.object_id in self._obj_cache
+            ]
+            self.objects.publish(publish)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scene publish failed: %s", e)
+        return most_recent
 
     def _find_and_project(
         self,
