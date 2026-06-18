@@ -33,6 +33,7 @@ from dimos.msgs.vision_msgs.Detection3DArray import Detection3DArray
 from dimos.perception.detection.detectors.yoloe import Yoloe2DDetector, YoloePromptMode
 from dimos.perception.detection.objectDB import ObjectDB
 from dimos.perception.detection.type.detection2d.imageDetections2D import ImageDetections2D
+from dimos.perception.detection.world_belief import WorldBelief, make_belief_engine
 from dimos.perception.detection.type.detection3d.object import (
     Object,
     Object as DetObject,
@@ -60,7 +61,7 @@ class ObjectSceneRegistrationModule(Module):
 
     _detector: Yoloe2DDetector | None = None
     _camera_info: CameraInfo | None = None
-    _object_db: ObjectDB
+    _object_db: ObjectDB | WorldBelief
     _latest_depth_image: Image | None = None
     _latest_camera_transform: Any = None
 
@@ -68,7 +69,10 @@ class ObjectSceneRegistrationModule(Module):
         self,
         target_frame: str = "map",
         prompt_mode: YoloePromptMode = YoloePromptMode.LRPC,
-        # ObjectDB tuning
+        # Object lifecycle engine: "world_belief" (Arch D — support-confirmed present-set, ghost-collapse
+        # resistant, real-data validated) or "objectdb" (legacy promote-by-count). Both share the same API.
+        belief_engine: str = "world_belief",
+        # engine tuning (shared kwargs; passed through to whichever engine is selected)
         distance_threshold: float = 0.2,
         min_detections_for_permanent: int = 6,
         # Object 3D reconstruction tuning
@@ -80,7 +84,8 @@ class ObjectSceneRegistrationModule(Module):
         super().__init__(**kwargs)
         self._target_frame = target_frame
         self._prompt_mode = prompt_mode
-        self._object_db = ObjectDB(
+        self._object_db = make_belief_engine(
+            belief_engine,
             distance_threshold=distance_threshold,
             min_detections_for_permanent=min_detections_for_permanent,
         )
